@@ -534,11 +534,16 @@ impl WebRTCServerSession {
             .insert("Access-Control-Allow-Origin".to_owned(), "*".to_owned());
         response.headers.insert(
             "Access-Control-Allow-Headers".to_owned(),
-            "content-type".to_owned(),
+            "content-type, authorization".to_owned(),
         );
-        response
-            .headers
-            .insert("Access-Control-Allow-Method".to_owned(), "POST".to_owned());
+        response.headers.insert(
+            "Access-Control-Allow-Methods".to_owned(),
+            "POST, DELETE".to_owned(),
+        );
+        response.headers.insert(
+            "Access-Control-Expose-Headers".to_owned(),
+            "Location".to_owned(),
+        );
         response
     }
 
