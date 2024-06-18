@@ -87,209 +87,216 @@ impl WebRTCServerSession {
         &mut self,
         uuid_2_sessions: Arc<Mutex<HashMap<Uuid, Arc<Mutex<WebRTCServerSession>>>>>,
     ) -> Result<(), SessionError> {
-        while self.reader.len() < 4 {
-            let data = self.io.lock().await.read().await?;
-            self.reader.extend_from_slice(&data[..]);
-        }
-
-        let mut remaining_data = self.reader.get_remaining_bytes();
-
-        if let Some(content_length) = parse_content_length(std::str::from_utf8(&remaining_data)?) {
-            while remaining_data.len() < content_length as usize {
-                log::trace!(
-                    "content_length: {} {}",
-                    content_length,
-                    remaining_data.len()
-                );
+        loop {
+            while self.reader.len() < 4 {
                 let data = self.io.lock().await.read().await?;
                 self.reader.extend_from_slice(&data[..]);
-                remaining_data = self.reader.get_remaining_bytes();
             }
-        }
 
-        let request_data = self.reader.extract_remaining_bytes();
+            let mut remaining_data = self.reader.get_remaining_bytes();
 
-        if let Some(http_request) = HttpRequest::unmarshal(std::str::from_utf8(&request_data)?) {
-            //POST /whip?app=live&stream=test HTTP/1.1
-            let eles: Vec<&str> = http_request.uri.path.splitn(2, '/').collect();
-            let pars_map = &http_request.query_pairs;
+            if let Some(content_length) =
+                parse_content_length(std::str::from_utf8(&remaining_data)?)
+            {
+                while remaining_data.len() < content_length as usize {
+                    log::trace!(
+                        "content_length: {} {}",
+                        content_length,
+                        remaining_data.len()
+                    );
+                    let data = self.io.lock().await.read().await?;
+                    self.reader.extend_from_slice(&data[..]);
+                    remaining_data = self.reader.get_remaining_bytes();
+                }
+            }
 
-            let exe_directory = if let Ok(mut exe_path) = std::env::current_exe() {
-                exe_path.pop();
-                exe_path.to_string_lossy().to_string()
-            } else {
-                "/app".to_string()
-            };
+            let request_data = self.reader.extract_remaining_bytes();
 
-            let request_method = http_request.method.as_str();
-            if request_method == http_method_name::GET {
-                let response = match http_request.uri.path.as_str() {
-                    "/" => Self::gen_file_response(
-                        format!("{}/{}", exe_directory, "index.html").as_str(),
-                    ),
-                    "/whip.js" => {
-                        Self::gen_file_response(format!("{}/{}", exe_directory, "whip.js").as_str())
-                    }
+            if let Some(http_request) = HttpRequest::unmarshal(std::str::from_utf8(&request_data)?)
+            {
+                //POST /whip?app=live&stream=test HTTP/1.1
+                let eles: Vec<&str> = http_request.uri.path.splitn(2, '/').collect();
+                let pars_map = &http_request.query_pairs;
 
-                    "/whep.js" => {
-                        Self::gen_file_response(format!("{}/{}", exe_directory, "whep.js").as_str())
-                    }
-
-                    _ => {
-                        log::warn!(
-                            "the http get path: {} is not supported.",
-                            http_request.uri.path
-                        );
-                        return Ok(());
-                    }
+                let exe_directory = if let Ok(mut exe_path) = std::env::current_exe() {
+                    exe_path.pop();
+                    exe_path.to_string_lossy().to_string()
+                } else {
+                    "/app".to_string()
                 };
 
-                self.send_response(&response).await?;
-                return Ok(());
-            }
+                let request_method = http_request.method.as_str();
+                if request_method == http_method_name::GET {
+                    let response = match http_request.uri.path.as_str() {
+                        "/" => Self::gen_file_response(
+                            format!("{}/{}", exe_directory, "index.html").as_str(),
+                        ),
+                        "/whip.js" => Self::gen_file_response(
+                            format!("{}/{}", exe_directory, "whip.js").as_str(),
+                        ),
 
-            if eles.len() < 2 || pars_map.get("app").is_none() || pars_map.get("stream").is_none() {
-                log::error!(
-                    "WebRTCServerSession::run the http path is not correct: {}",
-                    http_request.uri.path
-                );
+                        "/whep.js" => Self::gen_file_response(
+                            format!("{}/{}", exe_directory, "whep.js").as_str(),
+                        ),
 
-                return Err(SessionError {
-                    value: errors::SessionErrorValue::HttpRequestPathError,
-                });
-            }
-
-            let t = eles[1];
-            let app_name = pars_map.get("app").unwrap().clone();
-            let stream_name = pars_map.get("stream").unwrap().clone();
-
-            log::info!("1:{},2:{},3:{}", t, app_name, stream_name);
-
-            match request_method {
-                http_method_name::POST => {
-                    let sdp_data = if let Some(body) = http_request.body.as_ref() {
-                        body
-                    } else {
-                        return Err(SessionError {
-                            value: errors::SessionErrorValue::HttpRequestEmptySdp,
-                        });
-                    };
-                    self.session_id = Some(Uuid::new(RandomDigitCount::Zero));
-
-                    let path = format!(
-                        "{}?{}&session_id={}",
-                        http_request.uri.path,
-                        http_request.uri.query.as_ref().unwrap(),
-                        self.session_id.unwrap()
-                    );
-                    let offer = RTCSessionDescription::offer(sdp_data.clone())?;
-
-                    let bearer_carrier = http_request
-                        .get_header(&"Authorization".to_string())
-                        .map(|header| SecretCarrier::Bearer(header.to_string()));
-                    let query_carrier = http_request
-                        .uri
-                        .query
-                        .as_ref()
-                        .map(|q| SecretCarrier::Query(q.to_string()));
-
-                    let token_carrier = bearer_carrier.or(query_carrier);
-
-                    match t.to_lowercase().as_str() {
-                        "whip" => {
-                            if let Some(auth) = &self.auth {
-                                auth.authenticate(&stream_name, &token_carrier, false)?;
-                            }
-                            self.publish_whip(app_name, stream_name, path, offer)
-                                .await?;
-                        }
-                        "whep" => {
-                            if let Some(auth) = &self.auth {
-                                auth.authenticate(&stream_name, &token_carrier, true)?;
-                            }
-                            self.subscribe_whep(app_name, stream_name, path, offer)
-                                .await?;
-                        }
                         _ => {
-                            log::error!(
-                                "current path: {}, method: {}",
-                                http_request.uri.path,
-                                t.to_lowercase()
+                            log::warn!(
+                                "the http get path: {} is not supported.",
+                                http_request.uri.path
                             );
+                            return Ok(());
+                        }
+                    };
+
+                    self.send_response(&response).await?;
+                    return Ok(());
+                }
+
+                if eles.len() < 2
+                    || pars_map.get("app").is_none()
+                    || pars_map.get("stream").is_none()
+                {
+                    log::error!(
+                        "WebRTCServerSession::run the http path is not correct: {}",
+                        http_request.uri.path
+                    );
+
+                    return Err(SessionError {
+                        value: errors::SessionErrorValue::HttpRequestPathError,
+                    });
+                }
+
+                let t = eles[1];
+                let app_name = pars_map.get("app").unwrap().clone();
+                let stream_name = pars_map.get("stream").unwrap().clone();
+
+                log::info!("1:{},2:{},3:{}", t, app_name, stream_name);
+
+                match request_method {
+                    http_method_name::POST => {
+                        let sdp_data = if let Some(body) = http_request.body.as_ref() {
+                            body
+                        } else {
                             return Err(SessionError {
-                                value: errors::SessionErrorValue::HttpRequestNotSupported,
+                                value: errors::SessionErrorValue::HttpRequestEmptySdp,
                             });
+                        };
+                        self.session_id = Some(Uuid::new(RandomDigitCount::Zero));
+
+                        let path = format!(
+                            "{}?{}&session_id={}",
+                            http_request.uri.path,
+                            http_request.uri.query.as_ref().unwrap(),
+                            self.session_id.unwrap()
+                        );
+                        let offer = RTCSessionDescription::offer(sdp_data.clone())?;
+
+                        let bearer_carrier = http_request
+                            .get_header(&"Authorization".to_string())
+                            .map(|header| SecretCarrier::Bearer(header.to_string()));
+                        let query_carrier = http_request
+                            .uri
+                            .query
+                            .as_ref()
+                            .map(|q| SecretCarrier::Query(q.to_string()));
+
+                        let token_carrier = bearer_carrier.or(query_carrier);
+
+                        match t.to_lowercase().as_str() {
+                            "whip" => {
+                                if let Some(auth) = &self.auth {
+                                    auth.authenticate(&stream_name, &token_carrier, false)?;
+                                }
+                                self.publish_whip(app_name, stream_name, path, offer)
+                                    .await?;
+                            }
+                            "whep" => {
+                                if let Some(auth) = &self.auth {
+                                    auth.authenticate(&stream_name, &token_carrier, true)?;
+                                }
+                                self.subscribe_whep(app_name, stream_name, path, offer)
+                                    .await?;
+                            }
+                            _ => {
+                                log::error!(
+                                    "current path: {}, method: {}",
+                                    http_request.uri.path,
+                                    t.to_lowercase()
+                                );
+                                return Err(SessionError {
+                                    value: errors::SessionErrorValue::HttpRequestNotSupported,
+                                });
+                            }
                         }
                     }
-                }
-                http_method_name::OPTIONS => {
-                    self.send_response(&Self::gen_response(http::StatusCode::OK))
-                        .await?
-                }
-                http_method_name::PATCH => {}
-                http_method_name::DELETE => {
-                    if let Some(session_id) = pars_map.get("session_id") {
-                        if let Some(uuid) = Uuid::from_str2(session_id) {
-                            //stop the running session and delete it.
-                            let mut uuid_2_sessions_unlock = uuid_2_sessions.lock().await;
-                            if let Some(session) = uuid_2_sessions_unlock.get(&uuid) {
-                                if let Err(err) = session.lock().await.close_peer_connection().await
-                                {
-                                    log::error!("close peer connection failed: {}", err);
+                    http_method_name::OPTIONS => {
+                        self.send_response(&Self::gen_response(http::StatusCode::OK))
+                            .await?
+                    }
+                    http_method_name::PATCH => {}
+                    http_method_name::DELETE => {
+                        if let Some(session_id) = pars_map.get("session_id") {
+                            if let Some(uuid) = Uuid::from_str2(session_id) {
+                                //stop the running session and delete it.
+                                let mut uuid_2_sessions_unlock = uuid_2_sessions.lock().await;
+                                if let Some(session) = uuid_2_sessions_unlock.get(&uuid) {
+                                    if let Err(err) =
+                                        session.lock().await.close_peer_connection().await
+                                    {
+                                        log::error!("close peer connection failed: {}", err);
+                                    } else {
+                                        log::info!("close peer connection successfully.");
+                                    }
+                                    uuid_2_sessions_unlock.remove(&uuid);
                                 } else {
-                                    log::info!("close peer connection successfully.");
+                                    log::warn!("the session :{}  is not exited.", uuid);
                                 }
-                                uuid_2_sessions_unlock.remove(&uuid);
-                            } else {
-                                log::warn!("the session :{}  is not exited.", uuid);
+                            }
+                        } else {
+                            log::error!(
+                                "the delete path does not contain session id: {}?{}",
+                                http_request.uri.path,
+                                http_request.uri.query.as_ref().unwrap()
+                            );
+                        }
+
+                        match t.to_lowercase().as_str() {
+                            "whip" => {
+                                Self::unpublish_whip(
+                                    app_name,
+                                    stream_name,
+                                    self.get_publisher_info(),
+                                    self.event_sender.clone(),
+                                )?;
+                            }
+                            "whep" => {}
+                            _ => {
+                                log::error!(
+                                    "current path: {}, method: {}",
+                                    http_request.uri.path,
+                                    t.to_lowercase()
+                                );
+                                return Err(SessionError {
+                                    value: errors::SessionErrorValue::HttpRequestNotSupported,
+                                });
                             }
                         }
-                    } else {
-                        log::error!(
-                            "the delete path does not contain session id: {}?{}",
-                            http_request.uri.path,
-                            http_request.uri.query.as_ref().unwrap()
+
+                        let status_code = http::StatusCode::OK;
+                        let response = Self::gen_response(status_code);
+                        self.send_response(&response).await?;
+                    }
+                    _ => {
+                        log::warn!(
+                            "WebRTCServerSession::unsupported method name: {}",
+                            http_request.method
                         );
                     }
-
-                    match t.to_lowercase().as_str() {
-                        "whip" => {
-                            Self::unpublish_whip(
-                                app_name,
-                                stream_name,
-                                self.get_publisher_info(),
-                                self.event_sender.clone(),
-                            )?;
-                        }
-                        "whep" => {}
-                        _ => {
-                            log::error!(
-                                "current path: {}, method: {}",
-                                http_request.uri.path,
-                                t.to_lowercase()
-                            );
-                            return Err(SessionError {
-                                value: errors::SessionErrorValue::HttpRequestNotSupported,
-                            });
-                        }
-                    }
-
-                    let status_code = http::StatusCode::OK;
-                    let response = Self::gen_response(status_code);
-                    self.send_response(&response).await?;
                 }
-                _ => {
-                    log::warn!(
-                        "WebRTCServerSession::unsupported method name: {}",
-                        http_request.method
-                    );
-                }
+
+                self.http_request_data = Some(http_request);
             }
-
-            self.http_request_data = Some(http_request);
         }
-
-        Ok(())
     }
 
     async fn publish_whip(
