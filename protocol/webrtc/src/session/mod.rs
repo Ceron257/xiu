@@ -285,6 +285,7 @@ impl WebRTCServerSession {
                         let status_code = http::StatusCode::OK;
                         let response = Self::gen_response(status_code);
                         self.send_response(&response).await?;
+                        return Ok(());
                     }
                     _ => {
                         log::warn!(
